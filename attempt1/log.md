@@ -1,0 +1,1 @@
+- I want to make a quick gemm kernel or even just a load kernel that can load things into the right format for WGMMA A and B. I want to use a generic smem layout
