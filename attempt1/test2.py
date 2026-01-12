@@ -21,30 +21,35 @@ class Test:
         # just launch 1 warpgroup that does these TMA loads and yeah
         self.kernel(a, b).launch(grid=1, block=128, stream=stream)
     
+    def create_initial_state(self, a: cute.Tensor, b: cute.Tensor):
+        state = {
+            'gmem_A': GMEMTensor(a),
+            'gmem_B': GMEMTensor(b),
+            'smem_A': SwizzledSMEM('sA', GemmPart.A, LayoutEnum.from_tensor(a), self.tile_shape_mnk, self.dtype, 2),
+            'smem_B': SwizzledSMEM('sB', GemmPart.B, LayoutEnum.from_tensor(b), self.tile_shape_mnk, self.dtype, 2)
+        }
+        return state
+    
     @cute.kernel
     def kernel(self, a: cute.Tensor, b: cute.Tensor):
-        gmem_A = GMEMTensor(a)
-        gmem_B = GMEMTensor(b)
+        state = self.create_initial_state(a, b)
 
-        smem_A = SwizzledSMEM('sA', GemmPart.A, gmem_A.major_mode, self.tile_shape_mnk, self.dtype, 2)
-        smem_B = SwizzledSMEM('sB', GemmPart.B, gmem_B.major_mode, self.tile_shape_mnk, self.dtype, 2)
-
-        self._populate_smem([smem_A, smem_B])
+        self._populate_smem([state['smem_A'], state['smem_B']])
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        smem_A.populate_ptr(storage)
-        smem_B.populate_ptr(storage)
+        state['smem_A'].populate_ptr(storage)
+        state['smem_B'].populate_ptr(storage)
 
-        # print(smem_A.tensor)
-        # print(smem_B.tensor)
+        print(state['smem_A'].tensor)
+        print(state['smem_B'].tensor)
 
         cta_coord_mn = (0, 0)
-        a_cpy = TMACopyG2S(gmem_A, smem_A, cta_coord_mn)
-        b_cpy = TMACopyG2S(gmem_B, smem_B, cta_coord_mn)
-        # print(a_cpy.tma_tensor)
-        # print(b_cpy.tma_tensor)
+        a_cpy = TMACopyG2S(state['gmem_A'], state['smem_A'], cta_coord_mn)
+        b_cpy = TMACopyG2S(state['gmem_B'], state['smem_B'], cta_coord_mn)
+        print(a_cpy.tma_tensor)
+        print(b_cpy.tma_tensor)
 
 
     def _populate_smem(self, shared_storage_objects):

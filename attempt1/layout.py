@@ -37,9 +37,12 @@ class SwizzledSMEM:
         else:
             return sm90_utils.make_smem_layout_b(major_mode, tile_shape_mnk, dtype, stages)
     
+    @property
+    def layout_one_stage(self):
+        return cute.slice_(self.layout, (None, None, 0))
+
     def get_one_stage_bytes(self):
-        sliced = cute.slice_(self.layout, (None, None, 0))
-        return cute.size_in_bytes(self.dtype, sliced)
+        return cute.size_in_bytes(self.dtype, self.layout_one_stage)
     
     def __str__(self):
         return 'SMEMT(' + str(self.tensor) + ')'
@@ -72,7 +75,9 @@ class TMACopyG2S:
         self.src_gmem, self.dst_smem = src_gmem, dst_smem
         self.op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
         self.tma_load_bytes = dst_smem.get_one_stage_bytes()
-        self.tma_atom, self.tma_tensor = cute.nvgpu.cpasync.make_tiled_tma_atom(self.op, src_gmem.tensor, dst_smem.layout, dst_smem.tile_shape, num_multicast=0)
+        self.tma_atom, self.tma_tensor = cute.nvgpu.cpasync.make_tiled_tma_atom(self.op, src_gmem.tensor, dst_smem.layout_one_stage, dst_smem.tile_shape, num_multicast=1)
+        
+        
         mn_dim_idx = 0 if dst_smem.gemm_type == GemmPart.A else 1
         self.partitioned_gmem = cute.local_tile(self.tma_tensor, cute.select(dst_smem.gemm_mnk, [mn_dim_idx, 2]), (cta_coord_mn[mn_dim_idx], None))
         self.k_iters = cute.size(self.partitioned_gmem, mode=[2]) # MN, K, restK
@@ -81,8 +86,10 @@ class TMACopyG2S:
     def get_copy_fn(self, **kwargs):
         s, g = cute.nvgpu.cpasync.tma_partition(self.tma_atom, 0, cute.make_layout(1), 
                                                 cute.group_modes(self.dst_smem.tensor, 0, cute.rank(self.dst_smem.tensor) - 1),
-                                                cute.group_modes(self.src_gmem.tensor, 0, cute.rank(self.src_gmem.tensor) - 1)
+                                                cute.group_modes(self.partitioned_gmem, 0, cute.rank(self.partitioned_gmem) - 1)
                                                 )
+        print(s)
+        print(g)
         def copy_tma(src_idx, dst_idx, **kwargs2):
             cute.copy(self.tma_atom, g[None, src_idx], s[None, dst_idx], **kwargs2, **kwargs)
         return copy_tma
