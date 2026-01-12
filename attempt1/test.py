@@ -36,6 +36,15 @@ class Test:
         smem_A.populate_ptr(storage)
         smem_B.populate_ptr(storage)
 
+        print(smem_A.tensor)
+        print(smem_B.tensor)
+
+        cta_coord_mn = (0, 0)
+        a_cpy = TMACopyG2S(gmem_A, smem_A, cta_coord_mn)
+        b_cpy = TMACopyG2S(gmem_B, smem_B, cta_coord_mn)
+        print(a_cpy.tma_tensor)
+        print(b_cpy.tma_tensor)
+
 
     def _populate_smem(self, shared_storage_objects):
         fields = {obj.name: obj.storage_type for obj in shared_storage_objects}
