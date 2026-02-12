@@ -17,3 +17,7 @@ def get_smem_layout(
         atom, modes, mode_order
     )
     return layout
+
+def get_tiled_mma(a_dtype, b_dtype, a_major_mode, b_major_mode, acc_dtype, tile_shape):
+    # if tile shape is none then you just do the entire tile size
+    pass

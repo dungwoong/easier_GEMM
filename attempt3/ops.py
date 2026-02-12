@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 import textwrap
 import my_types as T
+from util import flatten_once
+from copy import deepcopy
 
 class NodeNamespace(Enum):
     ANY=0
@@ -54,15 +56,28 @@ class NodeBase:
         self.writes = set()
 
         self.children = []
+        self.parent = None
+    
+    def set_parent(self, p):
+        assert self.parent is None, f'{self} {type(self)} {self.parent}, {p}'
+        self.parent = p
     
     def add_child(self, c):
         assert isinstance(c, NodeBase)
         self.children.append(c)
+        c.set_parent(self)
     
     def add_children(self, *children):
         for c in children:
             assert isinstance(c, NodeBase)
+            c.set_parent(self)
         self.children.extend(children)
+    
+    def replace_child(self, old_child, new_child):
+        assert old_child in self.children
+        idx = self.children.index(old_child)
+        self.children[idx] = new_child
+        old_child.parent = None
     
     # setup and generate are codegen functions, to go to even lower IR
     def setup(self):
@@ -74,7 +89,7 @@ class NodeBase:
     def accept(self, visitor):
         visit_fn = getattr(visitor, f'visit_{self.__class__.__name__}', None)
         if callable(visit_fn):
-            visit_fn(self)
+            return visit_fn(self)
 
 
 # References: just check if things are in scope
@@ -149,6 +164,10 @@ class ConstantReference(NodeBase):
         super().__init__()
         self.val = val
     
+    @property
+    def var(self): # compatible with VarReference when needed :(
+        return self.val
+    
     def __repr__(self):
         return str(self.val)
 
@@ -176,14 +195,22 @@ class Kernel:
 
 {textwrap.indent(repr(self.call), "  ")}
 """.strip()
-    
-class Scope(NodeBase):
-    def __init__(self, nthreads):
+
+class ThreadScope(NodeBase):
+    def __init__(self):
         super().__init__()
-        self.nthreads = nthreads
+    
+    @property
+    def nthreads(self):
+        return self.children[0]
+    
+class Scope(ThreadScope):
+    def __init__(self, nthreads: int):
+        super().__init__()
+        self.children.append(ConstantReference(nthreads))
     
     def __repr__(self):
-        children = '\n'.join(repr(c) for c in self.children)
+        children = '\n'.join(repr(c) for c in self.children[1:])
         return f"""if (create_group({self.nthreads})):
 {textwrap.indent(children, "  ")}
 """.strip()
@@ -213,7 +240,7 @@ def call({args}stream: cuda.CUstream):
 {repr(self.kernel_defn)}
 """.strip()
 
-class KernelFunction(NodeBase):
+class KernelFunction(ThreadScope):
     def __init__(self):
         super().__init__()
         self.kernel_args = None
@@ -221,12 +248,6 @@ class KernelFunction(NodeBase):
     @property
     def nthreads(self):
         return self.children[0]
-    
-    # last item must be a loop
-    @property
-    def mainloop(self):
-        assert len(self.children) >= 1
-        return self.children[-1]
     
     def children_to_ignore(self): # when generating kernel args
         return self.children[:1]
@@ -265,9 +286,10 @@ class Loop(NodeBase):
 # TODO these should actually do some work e.g. convert the global matrix into TMA atom/tensor
 class GlobalTensorInit(NodeBase): # collect global arg param
     def __init__(self, t, var: VarDecl): # idk what to do about this for now...
+        # TODO deal with t later, what is going on
         super().__init__()
         self.dtype = t # should this be a child...
-        self.type = Type(T.GlobalTensor) # so we assume that only global tensors are allowed as global args...
+        var.type = Type(T.GlobalTensor) # so we assume that only global tensors are allowed as global args...
         self.add_child(var)
     
     @property
@@ -307,6 +329,7 @@ class GemmAccInit(NodeBase):
     def __repr__(self):
         return f'{self.children[0]} = GemmAcc{tuple(self.children[1:])}'
 
+# TODO add shared pointer somehow
 class PipelineInit(NodeBase):
     def __init__(self, decl_var, stages: Argument):
         super().__init__()
@@ -334,7 +357,7 @@ class TMALoadG2S(NodeBase):
     def __init__(self, global_tensor: Argument, shared_tensor: Argument, 
                  tile_size_m: Argument, tile_size_n: Argument, 
                  coord_row: Optional[Argument], coord_col: Optional[Argument], loop_var: Optional[Argument],
-                 shared_idx: Argument):
+                 pipeline: Argument, pipe_state: Argument):
         super().__init__()
         self.add_child(global_tensor)
         self.add_child(shared_tensor)
@@ -342,7 +365,8 @@ class TMALoadG2S(NodeBase):
         self.add_child(tile_size_n)
         self.add_child(loop_var if coord_row is None else coord_row)
         self.add_child(loop_var if coord_col is None else coord_col)
-        self.add_child(shared_idx)
+        self.add_child(pipeline)
+        self.add_child(pipe_state)
     
     @property
     def global_tensor(self):
@@ -361,8 +385,12 @@ class TMALoadG2S(NodeBase):
         return (self.children[4], self.children[5])
 
     @property
-    def shared_idx(self):
+    def pipe(self):
         return self.children[6]
+    
+    @property
+    def state(self):
+        return self.children[7]
     
     # def setup(self):
     #     # need to partition etc.
@@ -379,7 +407,20 @@ class TMALoadG2S(NodeBase):
     #     return [arr, ld, wait]
     
     def __repr__(self):
-        return f"{self.shared_tensor}[{self.shared_idx}] = TMAload({self.global_tensor}, {self.tile_size}, {self.coords})"
+        return f"{self.shared_tensor}[{self.state}] = TMAload({self.global_tensor}, {self.tile_size}, {self.coords}, {self.pipe})"
+
+
+# there could be some interesting checks here, we need to think about it but we can just add it to the visitor later
+# I actually don't care, we can just make a class that handles this entire thing, once we point memory at it
+# TODO maybe set whether to reuse memory here
+class EpilogueStore(NodeBase):
+    def __init__(self, accumulators: Argument, global_tensor: Argument): # TODO add output coords
+        super().__init__()
+        self.add_children(accumulators, global_tensor)
+    
+    def __repr__(self):
+        return f'{self.children[1]} = epilogue_store({self.children[0]})'
+
 
 class Gemm(NodeBase):
     def __init__(self, gemm_tiled,
@@ -400,6 +441,17 @@ class TiledGemmInit(NodeBase):
     def __repr__(self):
         return f"{self.children[0]} = TiledGemm{tuple(self.children[1:])}"
 
+class PipelineStateInit(NodeBase):
+    def __init__(self, state: Declaration, stages: Argument):
+        super().__init__()
+        assert isinstance(stages, Argument)
+        state.type = Type(T.PipelineState, (stages.var,)) # TODO not sure if this is how we should do it
+        self.add_children(state, stages)
+    
+    def __repr__(self):
+        return f"{self.children[0]} = PipelineState({self.children[1]})"
+
+
 # we should also write like an nwarps calculation somehow so we can use it when warp specializing(?)
 class CalculateTotalThreads(NodeBase): # calculate number of threads, we need to somehow do this based on mma sizes etc
     # we can probably throw this on before doing analysis you just add a pass to move MMA type decls into __call__ and add CalculateThreadsDecl
@@ -412,6 +464,38 @@ class CalculateTotalThreads(NodeBase): # calculate number of threads, we need to
     def __repr__(self):
         args = ', '.join(repr(c) for c in self.children[2:]) + ', ' if len(self.children) > 2 else ''
         return f"{self.children[0]} = NThreads({args}warp_specialize={self.children[1]})"
+
+
+def copy_arg(c: Argument):
+    assert isinstance(c, Argument), "Only Arguments(References to variables or constants) can be copied"
+    cpy = deepcopy(c)
+    cpy.parent = None
+    return cpy
+
+# def CustomType(name, repr_fn, superclass=NodeBase):
+#     assert issubclass(superclass, NodeBase)
+#     assert callable(repr_fn)
+#     return type(name, (superclass,), {'__repr__': repr_fn})
+
+class CustomFuncNode(NodeBase):
+    def __init__(self, stmt, children):
+        super().__init__()
+        self._stmt = stmt # lambda function that takes self as argument
+        children = [self._copy_remove_parent(c) for c in children]
+        self.add_children(*children)
+    
+    # if you wanna reuse a decl you have to go thru this(TODO we can refactor this to be better in a sec)
+    def _copy_remove_parent(self, c: Argument):
+        assert isinstance(c, Argument), "Only VarReferences and ConstantReferences can be copied"
+        cpy = deepcopy(c)
+        cpy.parent = None
+        return cpy
+    
+    def stmt(self):
+        return self._stmt(self)
+    
+    def __repr__(self):
+        return self.stmt()
 
 
 def postorder_visit(visitor, root: KernelClass):
@@ -430,11 +514,15 @@ def postorder_visit(visitor, root: KernelClass):
     print(f'{visitor.label} completed')
 
 
+# decls happen once
+# references are valid
+# functions get called with the correct type
 class DeclCheckVisitor:
     label = 'Decl Check'
     def __init__(self):
         # these might have to be dicts later
         self.symbols = [] # class, call, kernel, loop
+        self.nthreads = []
         self.current_stack_idx = -1
         self.kernel_fn = None
         self.call_fn = None
@@ -444,24 +532,66 @@ class DeclCheckVisitor:
     def visit(self, node):
         node.accept(self)
     
-    def get_var(self, var: Var):
+    def _current_scope_threads(self):
+        return self.nthreads[self.current_stack_idx]
+    
+    def _get_var(self, var: Var):
         result = None
+        t = None
         for i in range(self.current_stack_idx+1):
             bwd_idx = self.current_stack_idx - i
             tbl = self.symbols[bwd_idx]
-            if var in tbl and not (not var.classvar and bwd_idx == 0):
+            if var in tbl and not (not var.classvar and bwd_idx == 0 and self.current_stack_idx > 0):
                 if result is not None:
                     print(f'Warning: {var} exists in multiple scopes')
                 else:
                     result = bwd_idx
-        return result
+                    t = tbl[var]
+        return result, t
+    
+    def get_var_scope(self, var: Var):
+        return self._get_var(var)[0]
+    
+    def get_var_type(self, var: Var):
+        return self._get_var(var)[1]
+    
+    def _check_var_type(self, var: Var, type: Type):
+        return self.get_var_type(var) == type
+    
+    def _assert_or_print_error(self, val, output):
+        if not val:
+            print(f'[ERROR] {output}')
+        return val
+
+    def _compare_types(self, t1, t2):
+        if isinstance(t1, Type) and isinstance(t2, Type):
+            return issubclass(t1.type, t2.type) # we can later check meta too
+        elif isinstance(t1, Type):
+            return issubclass(t1.type, t2)
+        elif isinstance(t2, Type):
+            return issubclass(t1, t2.type)
+        else:
+            return issubclass(t1, t2)
+    
+    def _argument_is_type(self, arg: Argument, t: Type | type):
+        # precondition: var exists in the symbol table with a type
+        if isinstance(arg, ConstantReference):
+            return self._compare_types(t, type(arg.val))
+        elif isinstance(arg, VarReference):
+            return self._compare_types(t, self.get_var_type(arg.var))
+        else:
+            raise NotImplementedError()
+    
+    def _decl_is_type(self, decl: VarDecl, t: Type | type):
+        return self._compare_types(decl.type, t)
     
     def enter(self, node):
         if isinstance(node, (KernelClass, CallFunction, KernelFunction, Scope, Loop)):
             self.current_stack_idx += 1
-            new_symbols = set()
+            new_symbols = dict()
             self.symbols.append(new_symbols)
             node._symbols = new_symbols
+            self.nthreads.append(node.nthreads.val if isinstance(node, ThreadScope) and isinstance(node.nthreads, ConstantReference) and isinstance(node.nthreads.val, int) else None)
         if isinstance(node, CallFunction):
             self.call_fn = node
         elif isinstance(node, KernelClass):
@@ -478,13 +608,13 @@ class DeclCheckVisitor:
             self.kernel_fn.kernel_args = args
             self.call_fn.kernel_args = args
 
-    def _visit_Decl(self, decl):
-        if self.get_var(decl.var) is not None: 
+    def _visit_Decl(self, decl: Declaration):
+        if self.get_var_scope(decl.var) is not None: 
             print(f'[ERROR] {decl.var} was declared twice')
-        self.symbols[self.current_stack_idx].add(decl.var)
+        self.symbols[self.current_stack_idx][decl.var] = decl.type
     
     def visit_VarReference(self, ref: VarReference):
-        var_lvl = self.get_var(ref.var)
+        var_lvl = self.get_var_scope(ref.var)
         if var_lvl is None:
             print(f'[ERROR] {ref.var} was referenced but not found')
         if self.current_stack_idx >= 2 and var_lvl == 1: # var is declared in __call__ but accessed in kernel
@@ -504,6 +634,67 @@ class DeclCheckVisitor:
     def visit_ConstantDecl(self, decl: ConstantDecl):
         self._visit_Decl(decl)
     
+    def visit_SharedTensorInit(self, node: SharedTensorInit):
+        self._assert_or_print_error(self.current_stack_idx == 2, 'SharedTensorInit can only happen in kernel')
+        if not self._assert_or_print_error(len(node.children) == 4, 'SharedTensorInit must have 4 children'):
+            return
+        self._assert_or_print_error(all(isinstance(c, Argument) for c in node.children[1:]), f"Children of SharedTensorInit must be arguments")
+        error = "SharedTensorInit r: int, c: int, stage: int"
+        self._assert_or_print_error(self._argument_is_type(node.children[1], int), error)
+        self._assert_or_print_error(self._argument_is_type(node.children[2], int), error)
+        self._assert_or_print_error(self._argument_is_type(node.children[3], int), error)
+    
+    def visit_GemmAccInit(self, node: GemmAccInit):
+        error = "GemmAccInit gemm: TiledGemm, r: int, c: int"
+        self._assert_or_print_error(self.current_stack_idx > 1, "GemmAcc can only be declared in kernel")
+        if not self._assert_or_print_error(len(node.children) == 4, error):
+            return
+        self._assert_or_print_error(all(isinstance(c, Argument) for c in node.children[1:]), f"Children of GemmAccInit must be arguments")
+        self._assert_or_print_error(isinstance(node.children[0], VarDecl) and self._decl_is_type(node.children[0], T.WgmmaAcc), f'GemmAccInit must declare WgmmaAcc')
+        self._assert_or_print_error(self._argument_is_type(node.children[1], T.TiledGemm), error)
+        self._assert_or_print_error(self._argument_is_type(node.children[2], int), error) # do we even need these, shouldn't this be in the wgmmaAcc metadata??
+        self._assert_or_print_error(self._argument_is_type(node.children[3], int), error)
+    
+    def visit_PipelineInit(self, node: PipelineInit):
+        self._assert_or_print_error(self.current_stack_idx == 2, "Pipeline can only be declared in kernel")
+        error = "Pipeline decl: VarDecl stages: int"
+        if not self._assert_or_print_error(len(node.children) == 2, error): # TODO add shared pointer somehow
+            return
+        self._assert_or_print_error(isinstance(node.children[0], VarDecl) and self._decl_is_type(node.children[0], T.Pipeline), error)
+        self._assert_or_print_error(isinstance(node.children[1], Argument) and self._argument_is_type(node.children[1], int), error)
+    
+    def visit_TMALoadG2S(self, node: TMALoadG2S):
+        self._assert_or_print_error(self.current_stack_idx > 1, "TMALoadG2S can only be done in kernel")
+        error = "TMALoadG2S: global_tensor: GlobalTensor, shared_tensor: GlobalTensor, tile_size_m: int, tile_size_n: int, coord_row: int, coord_col: int, loop_var: int, shared_idx: int"
+        if not self._assert_or_print_error(len(node.children) == 8, error):
+            return
+        for i, t in enumerate((T.GlobalTensor, T.SharedTensor, int, int, int, int, T.Pipeline, T.PipelineState)):
+            self._assert_or_print_error(isinstance(node.children[i], Argument) and self._argument_is_type(node.children[i], t), f'TMALoadG2S: Problem at {node.children[i]}. Expected type {str(t)}')
+
+
+class LowerVisitor:
+    label="Lower"
+    def __init__(self):
+        pass
+
+    def enter(self, node): ...
+
+    def exit(self, node: NodeBase):
+        # flatten children
+        node.children = flatten_once(node.children)
+    
+    def visit(self, node: NodeBase):
+        output = node.accept(self)
+        if isinstance(output, list):
+            p = node.parent
+            p.replace_child(node, output)
+
+    def visit_TMALoadG2S(self, node: TMALoadG2S):
+        # TODO I can maybe use the type() type declaration method to actually create quick custom classes
+        pipe_wait = CustomFuncNode(stmt=lambda self: f'{node.state}.producer_acquire()', children=[node.state, node.pipe])
+        load_node = CustomFuncNode(stmt=lambda self: f'TMAload({node.global_tensor}, {node.shared_tensor}, {node.coords}, {node.state}, {node.pipe})', children=[node.global_tensor, node.shared_tensor, *node.coords, node.state, node.pipe])
+        pipe_commit = CustomFuncNode(stmt=lambda self: f'{node.state}.producer_commit()', children=[node.state])
+        return [pipe_wait, load_node, pipe_commit]
 
 def var_ref(name):
     return VarReference(Var(name))
@@ -520,22 +711,32 @@ dtype = Var('dtype', True)
 acc_dtype = Var('acc_dtype', True)
 a_g = Var('a')
 b_g = Var('b')
-pipe = Var('pipe_ab')
+c_g = Var('c')
+pipe_a = Var('pipe_a')
+pipe_b = Var('pipe_b')
 acc = Var('acc')
 nthreads = Var('nthreads')
+a_state = Var('a_state')
+b_state = Var('b_state')
 kernel = KernelFunction()
 kernel.add_child(VarReference(nthreads))
+kernel.add_child(PipelineInit(VarDecl(pipe_a), VarReference(stages)))
+kernel.add_child(PipelineInit(VarDecl(pipe_b), VarReference(stages)))
 kernel.add_child(SharedTensorInit(var_ref2(tile_m), var_ref2(tile_k), var_ref2(stages), VarDecl(Var('As')))) # but for SMEM we should store the dims ahead of time
 kernel.add_child(SharedTensorInit(var_ref2(tile_n), var_ref2(tile_k), var_ref2(stages), VarDecl(Var('Bs'))))
 kernel.add_child(GemmAccInit(var_ref('tiled_mma'), VarReference(tile_m), VarReference(tile_n), VarDecl(acc)))
 loop = Loop('k', ConstantReference(4))
-loop.add_child(TMALoadG2S(var_ref('a'), var_ref('As'), var_ref2(tile_m), var_ref2(tile_k), ConstantReference('bidx'), None, var_ref('k'), var_ref2(pipe))) # need to add pipelinestate
-loop.add_child(TMALoadG2S(var_ref('b'), var_ref('Bs'), var_ref2(tile_n), var_ref2(tile_k), ConstantReference('bidy'), None, var_ref('k'), var_ref2(pipe)))
-loop.add_child(Gemm(var_ref('tiled_mma'), var_ref('As'), var_ref('Bs'), var_ref('acc'), var_ref2(pipe), var_ref2(pipe)))
+
+# TODO fix these constant references to bidx, bidy
+loop.add_child(TMALoadG2S(var_ref('a'), var_ref('As'), var_ref2(tile_m), var_ref2(tile_k), ConstantReference('bidx'), None, var_ref('k'), var_ref2(pipe_a), var_ref2(a_state))) # need to add pipelinestate
+loop.add_child(TMALoadG2S(var_ref('b'), var_ref('Bs'), var_ref2(tile_n), var_ref2(tile_k), ConstantReference('bidy'), None, var_ref('k'), var_ref2(pipe_b), var_ref2(b_state)))
+loop.add_child(Gemm(var_ref('tiled_mma'), var_ref('As'), var_ref('Bs'), var_ref('acc'), var_ref2(a_state), var_ref2(b_state)))
 
 scope = Scope(256)
-scope.add_child(PipelineInit(VarDecl(pipe), VarReference(stages)))
+scope.add_child(PipelineStateInit(VarDecl(a_state), VarReference(stages))) # we can also check that these aren't classvars
+scope.add_child(PipelineStateInit(VarDecl(b_state), VarReference(stages))) # TODO use this
 scope.add_child(loop)
+scope.add_child(EpilogueStore(VarReference(acc), VarReference(c_g)))
 kernel.add_child(scope)
 # print(kernel)
 
@@ -546,6 +747,7 @@ callfunction.add_child(TiledGemmInit(VarDecl(Var('tiled_mma')), VarReference(dty
                    VarReference(acc_dtype), VarReference(tile_m), VarReference(tile_n), VarReference(tile_k)))
 callfunction.add_child(GlobalTensorInit(GlobalMatrix((64, 128), (0, 1)), VarDecl(a_g))) # we can store this data here since we'd only know this at runtime
 callfunction.add_child(GlobalTensorInit(GlobalMatrix((128, 128), (0, 1)), VarDecl(b_g)))
+callfunction.add_child(GlobalTensorInit(GlobalMatrix((64, 128), (0, 1)), VarDecl(c_g)))
 callfunction.add_child(CalculateTotalThreads(VarDecl(nthreads, int), ConstantReference(False), var_ref('tiled_mma')))
 callfunction.add_child(kernel)
 
@@ -561,6 +763,10 @@ kc.add_child(callfunction)
 
 dv = DeclCheckVisitor()
 postorder_visit(dv, kc)
+# print(kc)
+
+pv = LowerVisitor()
+postorder_visit(pv, kc)
 print(kc)
 
 # CHECKS

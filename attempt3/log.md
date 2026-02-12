@@ -32,3 +32,55 @@ Later on
 - Actually, for MMA, loads, computations we should store data types(e.g. when initializing an MMA or computation)
 - we can make dummy types and I think Type() is still good since isinstance won't work on e.g. cutlass.Float32
 - still need to do checks with these types but at least type system is implemented(kinda)
+
+## Egg
+- export e-graph?
+- export entire e-graph?
+- scoring stuff?
+- serialization and custom extraction
+- analysis?
+- reprod tensat-MCTS
+
+## other
+- triton has convert-layout operations that do stuff
+- triton tile sizes are known compile-time, matrix sizes aren't
+- other MLCompilers you know matrix size but not tile size
+- what layouts are possible might depend on warp config, tile size etc. that might be the biggest problem
+- modelling synchronization could be difficult
+- making more decisions at the e-graph level would be useful
+- consider what's possible in cutedsl, since we can't go lower than that
+- main problem is fusing incompatible layouts or something like that and checking validity of those
+
+checks
+- types match, sizes match, compatible layouts. I can add checks as I go
+- within passes you can make sure an optimization is doable
+
+## additions
+- scopes specify nthreads and specific operations can specify the number of threads participating
+- even like warpgroup.regalloc and stuff can do this
+- but if nthreads is dynamic, then we can't tell
+- we can add these checks once we have some sort of kernel up and running
+- we ALSO have to specify memory regions for stuff and read/write to them to model the lower-level dependencies
+    - only RuntimeFuncNodes will have reads/writes, but we need to know how to add these reads/writes to them...
+
+## TODOs
+- pipeline needs consumer/producer groups I think
+- [DONE] need pipeline stage
+- we can add a layout permute function for global matrix
+- pipeline: if pipeline extent is 1 we can have it generate differently so it makes an mbarrier instead yknow
+
+Tracking threads
+- we can infer how many threads come from the type of certain variables(e.g. the tiledMMA or the pipeline)
+
+Tracking reads/writes
+- the type classes could have functions that accept an access, and they store what last accessed them so then all we have to do is use these different types
+
+Scopes
+- we could attach a minimum scope to everything e.g. things that must be in the kernel as a flag, so we can move setup things around.
+- we just don't touch runtime things
+
+Adding tile scheduler
+- probably best to abstract the grid thing away in a tile scheduler, so we can write a generic one for GEMM or smth
+- this will get rid of all problems related to finding what tile to do
+
+We can probably just start transforming everything to the equivalent cutedsl stuff
